@@ -1,0 +1,26 @@
+# Salesforce credentials — never commit
+.sfdc_config.json
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Exported Salesforce data — may contain customer or confidential records
+*.csv
+*.json
+!.sfdc_config.example.json
+exports/
+data/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
