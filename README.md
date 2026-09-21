@@ -1,4 +1,4 @@
-# SFDC Tools
+# sfdc_mcp
 
 A Salesforce data exporter and MCP server for Claude. Query, search, and write Salesforce data using your browser session cookie — no connected app or OAuth setup required.
 
@@ -14,8 +14,8 @@ A Salesforce data exporter and MCP server for Claude. Query, search, and write S
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/<your-user>/sfdc-tools.git
-cd sfdc-tools
+git clone https://github.com/khensler/sfdc_mcp.git
+cd sfdc_mcp
 ```
 
 Two files do the work, and they must stay in the same directory:
@@ -90,8 +90,8 @@ Or add it manually to your Claude Code MCP config (`.claude.json`), substituting
 {
   "mcpServers": {
     "sfdc": {
-      "command": "/path/to/sfdc-tools/venv/bin/python",
-      "args": ["/path/to/sfdc-tools/sfdc_mcp_server.py"]
+      "command": "/path/to/sfdc_mcp/venv/bin/python",
+      "args": ["/path/to/sfdc_mcp/sfdc_mcp_server.py"]
     }
   }
 }
@@ -103,8 +103,8 @@ To pass credentials directly instead of using the saved config file, add an `env
 {
   "mcpServers": {
     "sfdc": {
-      "command": "/path/to/sfdc-tools/venv/bin/python",
-      "args": ["/path/to/sfdc-tools/sfdc_mcp_server.py"],
+      "command": "/path/to/sfdc_mcp/venv/bin/python",
+      "args": ["/path/to/sfdc_mcp/sfdc_mcp_server.py"],
       "env": {
         "SFDC_SESSION_ID": "your_sid_value",
         "SFDC_INSTANCE_URL": "https://yourorg.my.salesforce.com"
