@@ -4,7 +4,7 @@ SFDC MCP Server
 Exposes Salesforce data export as MCP tools for Claude.
 
 Setup (one-time):
-  pip install mcp
+  pip install "mcp>=2"
   python sfdc_export.py --setup   # save your browser session cookie
 
 Add to Claude Code MCP config:
@@ -24,19 +24,21 @@ Add to Claude Code MCP config:
 Or omit "env" to use the saved .sfdc_config.json from sfdc_export.py --setup.
 """
 
+import functools
 import io
 import json
 import sys
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Reuse client logic from sfdc_export.py in the same directory
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sfdc_export import SalesforceClient, flatten_record, load_config
 
-mcp = FastMCP("sfdc", instructions=(
+mcp = MCPServer("sfdc", instructions=(
     "Tools for querying, searching, and writing Salesforce data. "
     "READ: sfdc_list_objects to discover objects, sfdc_describe_object to see fields, "
     "sfdc_query for SOQL (SELECT ... FROM ... WHERE ...), "
@@ -52,6 +54,22 @@ mcp = FastMCP("sfdc", instructions=(
 ))
 
 
+def _tool(fn):
+    """Register fn as an MCP tool, passing expected errors through to the model.
+
+    mcp 2.x hides the text of any exception that isn't a ToolError, so without
+    this the model would see "Error executing tool X" instead of, say,
+    "Salesforce API error 401: Session expired or invalid".
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except (RuntimeError, ValueError, OSError) as e:
+            raise ToolError(str(e)) from e
+    return mcp.tool()(wrapper)
+
+
 def _client() -> SalesforceClient:
     config = load_config()
     session_id = config.get("session_id")
@@ -65,7 +83,7 @@ def _client() -> SalesforceClient:
     return SalesforceClient(session_id, instance_url)
 
 
-@mcp.tool()
+@_tool
 def sfdc_test_connection() -> str:
     """Test the Salesforce connection and confirm the session is valid."""
     client = _client()
@@ -73,7 +91,7 @@ def sfdc_test_connection() -> str:
     return f"Connected to {client.instance_url} — {len(info)} API resources available (API {client.base_url.split('/')[-1]})"
 
 
-@mcp.tool()
+@_tool
 def sfdc_list_objects(search: Optional[str] = None) -> str:
     """
     List all Salesforce objects (SObjects) queryable by this user.
@@ -95,7 +113,7 @@ def sfdc_list_objects(search: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_tool
 def sfdc_describe_object(object_name: str) -> str:
     """
     Show all fields available on a Salesforce object.
@@ -118,7 +136,7 @@ def sfdc_describe_object(object_name: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_tool
 def sfdc_query(soql: str, format: str = "csv", limit_preview: int = 0) -> str:
     """
     Run a SOQL query and return results as CSV or JSON.
@@ -159,7 +177,7 @@ def sfdc_query(soql: str, format: str = "csv", limit_preview: int = 0) -> str:
     return buf.getvalue() + preview_note
 
 
-@mcp.tool()
+@_tool
 def sfdc_search(sosl: str, format: str = "json") -> str:
     """
     Run a SOSL (Salesforce Object Search Language) full-text search across one or more objects.
@@ -195,7 +213,7 @@ def sfdc_search(sosl: str, format: str = "json") -> str:
     return buf.getvalue()
 
 
-@mcp.tool()
+@_tool
 def sfdc_search_to_file(sosl: str, output_path: str, format: str = "csv") -> str:
     """
     Run a SOSL full-text search and write results to a file. Use for large result sets.
@@ -231,7 +249,7 @@ def sfdc_search_to_file(sosl: str, output_path: str, format: str = "csv") -> str
     return f"Wrote {len(records)} records to {output_path}"
 
 
-@mcp.tool()
+@_tool
 def sfdc_query_to_file(soql: str, output_path: str, format: str = "csv") -> str:
     """
     Run a SOQL query and write the full results to a file. Use this for large exports.
@@ -266,7 +284,7 @@ def sfdc_query_to_file(soql: str, output_path: str, format: str = "csv") -> str:
     return f"Wrote {len(records)} records to {output_path}"
 
 
-@mcp.tool()
+@_tool
 def sfdc_opportunity_history(
     opportunity_id: str,
     format: str = "table",
@@ -349,7 +367,7 @@ def sfdc_opportunity_history(
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_tool
 def sfdc_create_record(object_name: str, fields: dict) -> str:
     """
     Create a new Salesforce record.
@@ -365,7 +383,7 @@ def sfdc_create_record(object_name: str, fields: dict) -> str:
     return f"Created {object_name} with Id {record_id}"
 
 
-@mcp.tool()
+@_tool
 def sfdc_update_record(object_name: str, record_id: str, fields: dict) -> str:
     """
     Update one or more fields on an existing Salesforce record.
