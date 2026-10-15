@@ -62,7 +62,10 @@ def save_config(session_id: str, instance_url: str):
 class SalesforceClient:
     def __init__(self, session_id: str, instance_url: str):
         self.session_id = session_id
-        self.instance_url = instance_url.rstrip("/")
+        # The Lightning UI domain 302-redirects API calls to my.salesforce.com;
+        # urllib turns a redirected POST into a GET and refuses to follow PATCH,
+        # so writes silently fail unless we call the API domain directly.
+        self.instance_url = instance_url.rstrip("/").replace(".lightning.force.com", ".my.salesforce.com")
         self.base_url = f"{self.instance_url}/services/data/{API_VERSION}"
 
     def _request(self, path: str, params: dict | None = None) -> dict:
