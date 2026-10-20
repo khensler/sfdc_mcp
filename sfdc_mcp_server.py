@@ -28,6 +28,7 @@ import functools
 import io
 import json
 import sys
+import threading
 from typing import Optional
 
 from mcp.server.mcpserver import MCPServer
@@ -36,9 +37,17 @@ from mcp.server.mcpserver.exceptions import ToolError
 # Reuse client logic from sfdc_export.py in the same directory
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sfdc_export import SalesforceClient, flatten_record, load_config
+from sfdc_export import SalesforceClient, SessionExpiredError, browser_login, flatten_record, load_config
+
+# Open a sign-in browser when the session is missing or expired. Set SFDC_AUTO_LOGIN=0 to disable.
+AUTO_LOGIN = os.environ.get("SFDC_AUTO_LOGIN", "1") != "0"
+LOGIN_TIMEOUT = int(os.environ.get("SFDC_LOGIN_TIMEOUT", "300"))
+_LOGIN_LOCK = threading.Lock()
 
 mcp = MCPServer("sfdc", instructions=(
+    "Sessions expire after a few hours; when one does, a tool opens a sign-in browser "
+    "automatically and retries, so the user may need to complete SSO mid-task. "
+    "Only run sfdc_login explicitly if a tool asks you to. "
     "Tools for querying, searching, and writing Salesforce data. "
     "READ: sfdc_list_objects to discover objects, sfdc_describe_object to see fields, "
     "sfdc_query for SOQL (SELECT ... FROM ... WHERE ...), "
@@ -54,17 +63,52 @@ mcp = MCPServer("sfdc", instructions=(
 ))
 
 
+def _login(dead_session_id: Optional[str]) -> None:
+    """Sign in through the browser, unless another call already replaced dead_session_id."""
+    with _LOGIN_LOCK:
+        config = load_config()
+        if config.get("session_id") and config.get("session_id") != dead_session_id:
+            return
+        instance_url = config.get("instance_url")
+        if not instance_url:
+            raise RuntimeError(
+                "No instance_url configured. Set SFDC_INSTANCE_URL or add instance_url to .sfdc_config.json."
+            )
+        try:
+            browser_login(instance_url, timeout_seconds=LOGIN_TIMEOUT)
+        except ImportError as e:
+            raise RuntimeError(
+                "Playwright is not installed. Run: pip install -r requirements.txt"
+            ) from e
+
+
 def _tool(fn):
     """Register fn as an MCP tool, passing expected errors through to the model.
 
     mcp 2.x hides the text of any exception that isn't a ToolError, so without
     this the model would see "Error executing tool X" instead of, say,
-    "Salesforce API error 401: Session expired or invalid".
+    "Salesforce API error 404: ...".
+
+    If the session is missing or expired, sign in through the browser and retry
+    once. Retrying writes is safe: a 401 means Salesforce rejected the request
+    before running it.
     """
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            try:
+                return fn(*args, **kwargs)
+            except SessionExpiredError:
+                # A pinned SFDC_SESSION_ID env var would override any new session.
+                if not AUTO_LOGIN or "SFDC_SESSION_ID" in os.environ:
+                    raise
+                _login(load_config().get("session_id"))
+                return fn(*args, **kwargs)
+        except SessionExpiredError as e:
+            raise ToolError(
+                f"{e} — the Salesforce session is missing or expired. Run sfdc_login "
+                "(or python sfdc_export.py --login) and complete sign-in in the browser."
+            ) from e
         except (RuntimeError, ValueError, OSError) as e:
             raise ToolError(str(e)) from e
     return mcp.tool()(wrapper)
@@ -74,13 +118,28 @@ def _client() -> SalesforceClient:
     config = load_config()
     session_id = config.get("session_id")
     instance_url = config.get("instance_url")
-    if not session_id or not instance_url:
+    if not instance_url:
         raise RuntimeError(
-            "No Salesforce credentials found. "
-            "Run: python sfdc_export.py --setup   "
+            "No Salesforce instance URL found. "
+            "Run: python sfdc_export.py --login --instance-url https://yourorg.my.salesforce.com   "
             "or set SFDC_SESSION_ID and SFDC_INSTANCE_URL env vars."
         )
+    if not session_id:
+        raise SessionExpiredError("No Salesforce session found.")
     return SalesforceClient(session_id, instance_url)
+
+
+@_tool
+def sfdc_login() -> str:
+    """
+    Sign in to Salesforce: opens a browser on the configured instance URL, waits for the
+    user to complete SSO, then captures and saves the working sid cookie. Other tools do
+    this automatically when the session expires; call this only if one asks you to.
+    """
+    _login(dead_session_id=load_config().get("session_id") or None)
+    client = _client()
+    client.test_connection()
+    return f"Signed in to {client.instance_url}; session saved."
 
 
 @_tool

@@ -4,6 +4,10 @@ SFDC Data Exporter
 Exports Salesforce data via SOQL using a browser session cookie (sid).
 
 Setup:
+  python sfdc_export.py --login --instance-url https://myorg.my.salesforce.com
+  (opens a browser; sign in and the sid cookie is captured automatically)
+
+  Or by hand:
   1. Log into Salesforce in your browser
   2. Open DevTools -> Application -> Cookies -> select your SF domain
   3. Copy the value of the 'sid' cookie
@@ -22,11 +26,27 @@ import csv
 import json
 import os
 import sys
-from urllib.parse import urlencode, urljoin
+import time
+from pathlib import Path
+from urllib.parse import urlencode, urljoin, urlparse
 import urllib.request
 import urllib.error
 
 API_VERSION = "v61.0"
+
+# Persistent browser profile for --login, so SSO is remembered between sign-ins.
+BROWSER_PROFILE_DIR = Path.home() / ".sfdc-mcp" / "browser-profile"
+
+
+class SessionExpiredError(RuntimeError):
+    """The API rejected the session id (HTTP 401)."""
+
+
+def _api_url(instance_url: str) -> str:
+    # The Lightning UI domain 302-redirects API calls to my.salesforce.com;
+    # urllib turns a redirected POST into a GET and refuses to follow PATCH,
+    # so writes silently fail unless we call the API domain directly.
+    return instance_url.rstrip("/").replace(".lightning.force.com", ".my.salesforce.com")
 
 
 def load_config() -> dict:
@@ -47,7 +67,9 @@ def load_config() -> dict:
     return config
 
 
-def save_config(session_id: str, instance_url: str):
+def write_config(session_id: str, instance_url: str) -> str:
+    """Write the session to .sfdc_config.json and return its path. Prints nothing,
+    because the MCP server calls this and its stdout is the protocol stream."""
     config_path = os.path.join(os.path.dirname(__file__), ".sfdc_config.json")
     with open(config_path, "w") as f:
         json.dump({"session_id": session_id, "instance_url": instance_url.rstrip("/")}, f, indent=2)
@@ -56,16 +78,93 @@ def save_config(session_id: str, instance_url: str):
     except OSError:
         # Best effort — mode bits are not enforced on all platforms (e.g. Windows).
         pass
+    return config_path
+
+
+def save_config(session_id: str, instance_url: str):
+    config_path = write_config(session_id, instance_url)
     print(f"Saved config to {config_path}")
+
+
+def _session_works(session_id: str, instance_url: str) -> bool:
+    try:
+        SalesforceClient(session_id, instance_url).test_connection()
+        return True
+    except (RuntimeError, OSError):
+        return False
+
+
+def browser_login(instance_url: str, timeout_seconds: int = 300, channel: str | None = None) -> str:
+    """Open a browser on instance_url, wait for the user to sign in, and return a
+    working sid. The session is saved to .sfdc_config.json.
+
+    Salesforce sets a sid cookie on several domains (my.salesforce.com,
+    lightning.force.com, file.force.com, ...) and only some of them are accepted
+    by the REST API, so each candidate is tried against the API, starting with
+    the one on the API host.
+    """
+    from playwright.sync_api import sync_playwright
+
+    instance_url = instance_url.rstrip("/")
+    api_host = urlparse(_api_url(instance_url)).hostname or ""
+    BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    launch_kwargs = {
+        "user_data_dir": str(BROWSER_PROFILE_DIR),
+        "headless": False,
+        "args": ["--disable-blink-features=AutomationControlled"],
+        "viewport": {"width": 1280, "height": 900},
+    }
+    if channel:
+        launch_kwargs["channel"] = channel
+
+    with sync_playwright() as pw:
+        try:
+            context = pw.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not start the login browser: {e}. Close any open login window, or "
+                "install a browser with: python -m playwright install chromium"
+            ) from e
+        try:
+            try:
+                from playwright_stealth import Stealth
+                Stealth().apply_stealth_sync(context)
+            except ImportError:
+                pass
+
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(instance_url, wait_until="domcontentloaded")
+
+            rejected: set[str] = set()
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                try:
+                    cookies = context.cookies()
+                except Exception as e:  # window closed by the user
+                    raise RuntimeError("The login browser was closed before sign-in completed.") from e
+
+                candidates = [c for c in cookies if c["name"] == "sid" and c["value"] not in rejected]
+                candidates.sort(key=lambda c: c["domain"].lstrip(".") != api_host)
+                for c in candidates:
+                    if _session_works(c["value"], instance_url):
+                        write_config(c["value"], instance_url)
+                        return c["value"]
+                    rejected.add(c["value"])
+                time.sleep(2)
+
+            raise RuntimeError(f"Sign-in was not completed within {timeout_seconds}s.")
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
 
 
 class SalesforceClient:
     def __init__(self, session_id: str, instance_url: str):
         self.session_id = session_id
-        # The Lightning UI domain 302-redirects API calls to my.salesforce.com;
-        # urllib turns a redirected POST into a GET and refuses to follow PATCH,
-        # so writes silently fail unless we call the API domain directly.
-        self.instance_url = instance_url.rstrip("/").replace(".lightning.force.com", ".my.salesforce.com")
+        self.instance_url = _api_url(instance_url)
         self.base_url = f"{self.instance_url}/services/data/{API_VERSION}"
 
     def _request(self, path: str, params: dict | None = None) -> dict:
@@ -86,6 +185,8 @@ class SalesforceClient:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode()
+            if e.code == 401:
+                raise SessionExpiredError(f"Salesforce API error 401: {body[:300]}")
             try:
                 errors = json.loads(body)
                 if isinstance(errors, list) and errors:
@@ -114,6 +215,8 @@ class SalesforceClient:
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as e:
             body_str = e.read().decode()
+            if e.code == 401:
+                raise SessionExpiredError(f"Salesforce API error 401: {body_str[:300]}")
             try:
                 errors = json.loads(body_str)
                 if isinstance(errors, list) and errors:
@@ -266,6 +369,23 @@ def cmd_setup(args):
         sys.exit(1)
 
 
+def cmd_login(args):
+    instance_url = args.instance_url or load_config().get("instance_url")
+    if not instance_url:
+        print("No instance URL. Pass --instance-url https://myorg.my.salesforce.com", file=sys.stderr)
+        sys.exit(1)
+    print(f"Opening {instance_url}")
+    print("Sign in in the browser window; it closes automatically once the session is captured.\n")
+    try:
+        browser_login(instance_url, timeout_seconds=args.timeout, channel="chrome" if args.chrome else None)
+    except RuntimeError as e:
+        print(f"Sign-in failed: {e}", file=sys.stderr)
+        if not args.chrome:
+            print("If SSO blocked the automated browser, retry with --chrome.", file=sys.stderr)
+        sys.exit(1)
+    print("Signed in. Session saved to .sfdc_config.json")
+
+
 def get_client(args) -> SalesforceClient:
     config = load_config()
 
@@ -274,7 +394,7 @@ def get_client(args) -> SalesforceClient:
 
     if not session_id or not instance_url:
         print(
-            "No session found. Run: python sfdc_export.py --setup\n"
+            "No session found. Run: python sfdc_export.py --login (or --setup)\n"
             "Or set SFDC_SESSION_ID and SFDC_INSTANCE_URL env vars.",
             file=sys.stderr,
         )
@@ -286,6 +406,9 @@ def get_client(args) -> SalesforceClient:
 def main():
     parser = argparse.ArgumentParser(description="SFDC Data Exporter")
     parser.add_argument("--setup", action="store_true", help="Interactive setup: save session cookie")
+    parser.add_argument("--login", action="store_true", help="Sign in through a browser and capture the sid cookie automatically")
+    parser.add_argument("--timeout", type=int, default=300, help="Seconds to wait for --login sign-in (default: 300)")
+    parser.add_argument("--chrome", action="store_true", help="Use installed Google Chrome for --login instead of bundled Chromium")
     parser.add_argument("--test", action="store_true", help="Test the current session")
     parser.add_argument("--objects", action="store_true", help="List all available SObjects")
     parser.add_argument("--describe", metavar="OBJECT", help="Show fields for an SObject")
@@ -299,6 +422,10 @@ def main():
 
     if args.setup:
         cmd_setup(args)
+        return
+
+    if args.login:
+        cmd_login(args)
         return
 
     if not any([args.test, args.objects, args.describe, args.query, args.search]):

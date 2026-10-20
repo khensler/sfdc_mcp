@@ -37,7 +37,19 @@ venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-### 3. Get your Salesforce session cookie
+### 3. Sign in
+
+```bash
+python sfdc_export.py --login --instance-url https://myorg.my.salesforce.com
+```
+
+This opens a Chromium window on your instance URL. Sign in (SSO included); once you land in Salesforce, the window closes and the working `sid` cookie is saved to `.sfdc_config.json`. Salesforce sets `sid` on several domains, so each one is tested against the API and the first that works is kept. After the first run, `--instance-url` can be omitted; it is read from the config file.
+
+The browser uses Playwright's bundled Chromium (`python -m playwright install chromium` if it isn't on the machine yet) with a persistent profile in `~/.sfdc-mcp/browser-profile`, so SSO is remembered between sign-ins. If SSO blocks the automated browser, add `--chrome` to use your installed Google Chrome.
+
+Then skip to step 5. Steps 3a and 4 are the manual alternative.
+
+### 3a. Get your Salesforce session cookie by hand
 
 1. Log into Salesforce in Chrome or Firefox.
 2. Open DevTools (`F12`) → **Application** tab → **Cookies** → select your Salesforce domain.
@@ -132,6 +144,7 @@ Once connected, Claude has access to these tools:
 
 | Tool | Description |
 |---|---|
+| `sfdc_login` | Sign in through a browser and save a fresh session |
 | `sfdc_test_connection` | Verify the session is valid |
 | `sfdc_list_objects` | List all queryable SObjects; optional `search` filter |
 | `sfdc_describe_object` | Show all fields on an object |
@@ -181,11 +194,11 @@ python sfdc_export.py --search "FIND {Jane Smith} IN NAME FIELDS RETURNING Conta
 
 ## Session Expiry
 
-Salesforce session cookies expire after your org's session timeout, typically 2–8 hours of inactivity. When you see a `401` or `INVALID_SESSION_ID` error, grab a fresh `sid` cookie from your browser and re-run:
+Salesforce session cookies expire after your org's session timeout, typically 2–8 hours of inactivity.
 
-```bash
-python sfdc_export.py --setup
-```
+The MCP server handles this for you: when a tool gets a `401` or finds no saved session, it opens a sign-in browser on your `instance_url`, waits for you to complete SSO, saves the new `sid`, and retries the call once. You can also trigger it with the `sfdc_login` tool. Set `SFDC_AUTO_LOGIN=0` to turn this off, or `SFDC_LOGIN_TIMEOUT` (seconds, default 300) to change how long it waits. Automatic sign-in is skipped when `SFDC_SESSION_ID` is set as an env var, because that would override the new session.
+
+From the CLI, re-run `python sfdc_export.py --login`, or grab a fresh `sid` by hand and run `python sfdc_export.py --setup`.
 
 ---
 
